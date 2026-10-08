@@ -1637,32 +1637,145 @@ static void a_pool_configuration_is_checked_before_it_is_taken(void) {
 // A coinbaser response names only the value it answers. One arriving late for
 // a request that timed out was taken for the next request with the same value
 // -- on Chains testnet every empty block has the same value -- and merged the
-// commitments of the job before, on another block, into this one.
+// commitments of the job before, on another block, into this one. The pool
+// also skips requests (no answer when it cannot pay out), so the gateway keeps
+// its outstanding requests in order and gives each response to the oldest one
+// asking that value; see datum_coinbaser_queue_match.
+static T_DATUM_COINBASER_REQ cb_ask(T_DATUM_COINBASER_QUEUE *q, uint64_t value, const unsigned char *block, uint64_t now) {
+	T_DATUM_COINBASER_REQ r = { 0 };
+	r.id = datum_coinbaser_queue_add(q, value, block, now);
+	r.value = value;
+	memcpy(r.prevhash, block, 32);
+	r.sent_tsms = now;
+	return r;
+}
+
+// What the response handler decides: whether a response for `value` is taken
+// by the request waiting.
+static bool cb_reply_taken(T_DATUM_COINBASER_QUEUE *q, uint64_t value, const T_DATUM_COINBASER_REQ *waiting, uint64_t now) {
+	T_DATUM_COINBASER_REQ answered = { 0 };
+	if (!datum_coinbaser_queue_match(q, value, now, &answered)) return false;
+	return datum_coinbaser_answer_serves(&answered, waiting);
+}
+
 static void a_late_coinbaser_answer_is_not_taken_for_the_next_job(void) {
-	unsigned char block_a[32], block_b[32];
+	const uint64_t V = 5000000000ULL, W = 5000012345ULL;
+	unsigned char block_a[32], block_b[32], block_c[32];
 	memset(block_a, 0xaa, 32);
 	memset(block_b, 0xbb, 32);
-	T_DATUM_COINBASER_REQ prev = { .valid = true, .answered = false, .value = 5000000000ULL, .sent_tsms = 100000 };
-	memcpy(prev.prevhash, block_a, 32);
-	const uint64_t now = 106000;
-	// Another value: never ours.
-	datum_test(!datum_coinbaser_response_is_for(4999999999ULL, 5000000000ULL, block_b, &prev, now));
-	// The request before, on another block, for the same value, unanswered: may be its answer.
-	datum_test(!datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, &prev, now));
-	// Its answer came already, or it was for the same block, or another value, or long ago: ours.
-	prev.answered = true;
-	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, &prev, now));
-	prev.answered = false;
-	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_a, &prev, now));
-	prev.value = 1;
-	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, &prev, now));
-	prev.value = 5000000000ULL;
-	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, &prev, prev.sent_tsms + DATUM_COINBASER_LATE_MS));
-	// No request before: ours.
-	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, NULL, now));
-	prev.valid = false;
-	datum_test(datum_coinbaser_response_is_for(5000000000ULL, 5000000000ULL, block_b, &prev, now));
-	printf("  a late coinbaser answer for a job on another block is not taken for the next one\n");
+	memset(block_c, 0xcc, 32);
+	T_DATUM_COINBASER_QUEUE q = { 0 };
+	T_DATUM_COINBASER_REQ a, a2, b, b2, none = { 0 };
+	
+	// A normal answer: taken, and nothing is left outstanding.
+	b = cb_ask(&q, V, block_b, 100000);
+	datum_test(cb_reply_taken(&q, V, &b, 100200));
+	datum_test(q.count == 0);
+	// Another value is never ours, and leaves the request outstanding.
+	b = cb_ask(&q, V, block_b, 101000);
+	datum_test(!cb_reply_taken(&q, V - 1, &b, 101100));
+	datum_test(q.count == 1);
+	datum_test(cb_reply_taken(&q, V, &b, 101200));
+	datum_test(q.count == 0);
+	
+	// A late answer to the job before, on another block, for the same value:
+	// not taken; the next response is ours.
+	a = cb_ask(&q, V, block_a, 110000); // times out, no answer within 5 s
+	b = cb_ask(&q, V, block_b, 116000);
+	datum_test(!cb_reply_taken(&q, V, &b, 117000)); // a's, late
+	datum_test(cb_reply_taken(&q, V, &b, 117100));  // b's
+	datum_test(q.count == 0);
+	// Several late ones in a row: each goes to its own request.
+	a = cb_ask(&q, V, block_a, 120000);
+	a2 = cb_ask(&q, V, block_a, 125000);
+	b = cb_ask(&q, V, block_b, 130000);
+	datum_test(!cb_reply_taken(&q, V, &b, 131000));
+	datum_test(!cb_reply_taken(&q, V, &b, 131100));
+	datum_test(cb_reply_taken(&q, V, &b, 131200));
+	datum_test(q.count == 0);
+	
+	// The late answer lands between two fetches, with no one waiting: it still
+	// retires its request, and the next job's answer, on another block, is
+	// taken. (The one-request-back rule dropped this one.)
+	a = cb_ask(&q, V, block_a, 140000);
+	datum_test(!cb_reply_taken(&q, V, &none, 146000));
+	b = cb_ask(&q, V, block_b, 147000);
+	datum_test(cb_reply_taken(&q, V, &b, 147300));
+	datum_test(q.count == 0);
+	
+	// The pool skips a request and answers the next with the same value on a
+	// new block. Evidently skipped -- a later request was answered first -- it
+	// is retired, and the new job's answer is taken.
+	a = cb_ask(&q, V, block_a, 150000);   // skipped: nothing comes
+	a2 = cb_ask(&q, W, block_a, 155000);  // answered: so `a` was skipped
+	datum_test(cb_reply_taken(&q, W, &a2, 155100));
+	datum_test(q.count == 0);
+	b = cb_ask(&q, V, block_b, 156000);
+	datum_test(cb_reply_taken(&q, V, &b, 156100));
+	// Skipped twice on the old block, then a request on the old block answered
+	// (as good for it as its own), then one on the new block: the pool took the
+	// first and skipped the rest, or answered late; either way one old request
+	// may still be answered, and an answer for the new block is not taken
+	// until that one has had its answer, or is DATUM_COINBASER_LATE_MS old.
+	a = cb_ask(&q, V, block_a, 160000);
+	a2 = cb_ask(&q, V, block_a, 165000);
+	datum_test(cb_reply_taken(&q, V, &a2, 165100)); // given to `a`, serves a2
+	datum_test(q.count == 1);
+	b = cb_ask(&q, V, block_b, 166000);
+	datum_test(!cb_reply_taken(&q, V, &b, 166100)); // given to a2
+	datum_test(cb_reply_taken(&q, V, &b, 166200));
+	datum_test(q.count == 0);
+	// A request on the old block DATUM_COINBASER_LATE_MS old is no longer in
+	// the way.
+	a = cb_ask(&q, V, block_a, 170000);
+	b = cb_ask(&q, V, block_b, 170000 + DATUM_COINBASER_LATE_MS - 1);
+	datum_test(cb_reply_taken(&q, V, &b, 170000 + DATUM_COINBASER_LATE_MS));
+	datum_test(q.count == 0);
+	// What cannot be told apart: skipped on the old block, answered on the new,
+	// nothing in between. The same on the wire as a late answer to the old
+	// request, and dropped as one: the new job falls back to the template's own
+	// commitments.
+	a = cb_ask(&q, V, block_a, 180000);
+	b = cb_ask(&q, V, block_b, 185000);
+	datum_test(!cb_reply_taken(&q, V, &b, 185100));
+	datum_test(q.count == 1);
+	datum_coinbaser_queue_clear(&q); // as a reconnect does
+	
+	// Impossible orders, handled safely. A response with no request at all,
+	// or for a value no outstanding request asked, is never taken and changes
+	// nothing.
+	datum_test(!cb_reply_taken(&q, V, &none, 190000));
+	b = cb_ask(&q, V, block_b, 190000);
+	datum_test(!cb_reply_taken(&q, W, &b, 190100));
+	datum_test(q.count == 1);
+	// An answer to a request whose wait is over retires it and is taken by no one.
+	datum_test(!cb_reply_taken(&q, V, &none, 190200));
+	datum_test(q.count == 0);
+	// A response after its request expired is matched to nothing.
+	b = cb_ask(&q, V, block_b, 200000);
+	datum_test(!cb_reply_taken(&q, V, &b, 200000 + DATUM_COINBASER_LATE_MS));
+	datum_test(q.count == 0);
+	// A second answer to a request already answered (the pool never sends
+	// one) goes to the next outstanding request for that value if there is
+	// one, and on another block is not taken by the request waiting.
+	a = cb_ask(&q, V, block_a, 210000);
+	datum_test(cb_reply_taken(&q, V, &a, 210100));
+	b = cb_ask(&q, W, block_b, 211000);
+	datum_test(!cb_reply_taken(&q, V, &b, 211100)); // the duplicate: no V outstanding
+	datum_test(cb_reply_taken(&q, W, &b, 211200));
+	// The queue never grows past its bound; the oldest goes first.
+	for (int k = 0; k < DATUM_COINBASER_OUTSTANDING + 5; k++) {
+		b2 = cb_ask(&q, V, (k & 1) ? block_b : block_c, 220000 + k);
+		datum_test(q.count <= DATUM_COINBASER_OUTSTANDING);
+	}
+	datum_test(q.count == DATUM_COINBASER_OUTSTANDING);
+	datum_test(q.req[q.count - 1].id == b2.id);
+	datum_coinbaser_queue_remove(&q, b2.id);
+	datum_test(q.count == DATUM_COINBASER_OUTSTANDING - 1);
+	datum_coinbaser_queue_remove(&q, b2.id); // not there any more: nothing
+	datum_test(q.count == DATUM_COINBASER_OUTSTANDING - 1);
+	(void)a; (void)a2;
+	printf("  coinbaser answers go to the oldest request asking their value; a late one is not taken for the next job, a skipped one is retired\n");
 }
 
 // A template from a plain node over 16383 transactions is cut to the first

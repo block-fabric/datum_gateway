@@ -123,17 +123,29 @@ typedef struct {
 int datum_protocol_init(void);
 int datum_encrypt_generate_keys(DATUM_ENC_KEYS *keys);
 bool datum_protocol_is_active(void);
-// A coinbaser request: what it asked for, and whether an answer to it came.
+// A coinbaser request still waiting for its answer: what it asked for, and when.
 typedef struct {
-	bool valid;
-	bool answered;
+	uint64_t id; // never 0
 	uint64_t value;
 	unsigned char prevhash[32];
 	uint64_t sent_tsms;
 } T_DATUM_COINBASER_REQ;
 // After this long no answer to a request is expected any more.
 #define DATUM_COINBASER_LATE_MS 30000
-bool datum_coinbaser_response_is_for(uint64_t resp_value, uint64_t req_value, const unsigned char *req_prevhash, const T_DATUM_COINBASER_REQ *prev, uint64_t now_tsms);
+// Requests kept waiting for an answer. One is sent per job and an unanswered
+// one holds the fetch for 5 s, so a few fit in DATUM_COINBASER_LATE_MS.
+#define DATUM_COINBASER_OUTSTANDING 16
+// The requests sent and not answered, oldest first. See datum_protocol.c.
+typedef struct {
+	T_DATUM_COINBASER_REQ req[DATUM_COINBASER_OUTSTANDING];
+	int count;
+	uint64_t next_id;
+} T_DATUM_COINBASER_QUEUE;
+void datum_coinbaser_queue_clear(T_DATUM_COINBASER_QUEUE *q);
+uint64_t datum_coinbaser_queue_add(T_DATUM_COINBASER_QUEUE *q, uint64_t value, const unsigned char *prevhash, uint64_t now_tsms);
+void datum_coinbaser_queue_remove(T_DATUM_COINBASER_QUEUE *q, uint64_t id);
+bool datum_coinbaser_queue_match(T_DATUM_COINBASER_QUEUE *q, uint64_t value, uint64_t now_tsms, T_DATUM_COINBASER_REQ *answered);
+bool datum_coinbaser_answer_serves(const T_DATUM_COINBASER_REQ *answered, const T_DATUM_COINBASER_REQ *waiting);
 // The longest coinbase tag taken from the pool: the same bound the gateway's own tags have.
 #define DATUM_POOL_TAG_MAX 60
 bool datum_pool_config_is_acceptable(const unsigned char *script, int script_len, int tag_len);
